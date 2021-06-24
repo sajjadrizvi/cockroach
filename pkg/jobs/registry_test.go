@@ -13,7 +13,9 @@ package jobs
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,13 +30,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -344,6 +351,387 @@ func TestBatchJobsCreation(t *testing.T) {
 						[][]string{{"succeeded"}})
 				}
 			}
+		})
+	}
+}
+
+// TestRetriesWithExponentialBackoff tests the working of exponential delays
+// when jobs are retried. Moreover, it tests the effectiveness of the upper
+// bound on the retry delay.
+func TestRetriesWithExponentialBackoff(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	unitTime := time.Millisecond
+	clusterSettings := func(
+		ctx context.Context, initialDelay time.Duration, maxDelay time.Duration,
+	) *cluster.Settings {
+		s := cluster.MakeTestingClusterSettings()
+		// Set a small adopt and cancel intervals to reduce test time.
+		adoptIntervalSetting.Override(ctx, &s.SV, unitTime)
+		cancelIntervalSetting.Override(ctx, &s.SV, unitTime)
+		retryInitialDelaySetting.Override(ctx, &s.SV, initialDelay)
+		retryMaxDelaySetting.Override(ctx, &s.SV, maxDelay)
+		return s
+	}
+
+	// createJob creates a fake job that we control for testing.
+	createJob := func(
+		ctx context.Context, s serverutils.TestServerInterface, r *Registry, kvDB *kv.DB,
+	) jobspb.JobID {
+		id := r.MakeJobID()
+		require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			_, err := r.CreateJobWithTxn(ctx, Record{
+				Details:  jobspb.ImportDetails{},
+				Progress: jobspb.ImportProgress{},
+			}, id, txn)
+			return err
+		}))
+		return id
+	}
+	validateCounts := func(t *testing.T, expectedResumed, resumed int64) {
+		require.Equal(t, expectedResumed, resumed, "unexpected number of jobs resumed")
+	}
+	waitUntilCount := func(t *testing.T, counter *metric.Counter, count int64) {
+		testutils.SucceedsSoon(t, func() error {
+			cnt := counter.Count()
+			if cnt >= count {
+				return nil
+			}
+			return errors.Errorf(
+				"waiting for %v to reach %d, currently at %d", counter.GetName(), count, cnt,
+			)
+		})
+	}
+	waitUntilStatus := func(t *testing.T, tdb *sqlutils.SQLRunner, jobID jobspb.JobID, status Status) {
+		tdb.CheckQueryResultsRetry(t,
+			fmt.Sprintf("SELECT status FROM [SHOW JOBS] WHERE job_id = %d", jobID),
+			[][]string{{string(status)}})
+	}
+
+	// pauseOrCancelJob pauses or cancels a job. If pauseJob is true, the job is paused,
+	// otherwise the job is canceled.
+	pauseOrCancelJob := func(
+		t *testing.T, ctx context.Context, db *kv.DB, registry *Registry, jobID jobspb.JobID, pauseJob bool,
+	) {
+		assert.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			if pauseJob {
+				return registry.PauseRequested(ctx, txn, jobID)
+			}
+			return registry.CancelRequested(ctx, txn, jobID)
+		}))
+	}
+
+	// nextDelay returns the next delay based calculated from the given retryCnt
+	// and exponential-backoff parameters.
+	nextDelay := func(
+		retryCnt int, initDelay time.Duration, maxDelay time.Duration,
+	) time.Duration {
+		delay := initDelay * ((1 << int(math.Min(62, float64(retryCnt)))) - 1)
+		if delay < 0 {
+			delay = maxDelay
+		}
+		return time.Duration(math.Min(float64(delay), float64(maxDelay)))
+	}
+
+	//waitUntilUnregistered := func(r *Registry, jobID jobspb.JobID) {
+	//	testutils.SucceedsSoon(t, func() error {
+	//		r.mu.Lock()
+	//		defer r.mu.Unlock()
+	//		if _, ok := r.mu.adoptedJobs[jobID]; !ok {
+	//			return nil
+	//		}
+	//		return errors.Errorf("waiting for the current resumer to unregister")
+	//	})
+	//}
+
+	// Number of retries should be reasonably large such that they are sufficient
+	// to test long delays but not too many to increase the test time.
+	const retries = 50
+	// initDelay and maxDelay can be large as we jump in time through a fake clock.
+	initDelay := time.Second
+	maxDelay := time.Hour
+
+	const (
+		// Job states to test, which explore different code paths in a job's lifecycle.
+		running             = "running"
+		revertingOnFailed   = "failed"
+		revertingOnCanceled = "canceled"
+		pauseRunning        = "pause-running"
+		pauseReverting      = "pause-reverting"
+		// To pause or cancel a job.
+		pause  = true
+		cancel = false
+	)
+
+	for _, testState := range []string{
+		running, revertingOnFailed, revertingOnCanceled, pauseRunning, pauseReverting,
+	} {
+		t.Run(testState, func(t *testing.T) {
+			ctx := context.Background()
+			var done atomic.Value
+			done.Store(false)
+			// Buffered channel so that registry can execute without synchronization.
+			transitionCh := make(chan struct{}, 3)
+
+			// We use a manual clock to control and evaluate job execution times.
+			// We initialize the clock with Now() because the job-creation timestamp,
+			// 'created' column in system.jobs, of a new job is set from txn's time.
+			clock := timeutil.NewManualTime(timeutil.Now())
+			timeSource := hlc.NewClock(func() int64 {
+				return clock.Now().UnixNano()
+			}, base.DefaultMaxClockOffset)
+			// Set up the test cluster.
+			cs := clusterSettings(ctx, initDelay, maxDelay)
+			args := base.TestServerArgs{
+				Settings: cs,
+				Knobs: base.TestingKnobs{
+					JobsTestingKnobs: &TestingKnobs{
+						TimeSource: timeSource,
+						AfterJobStateMachine: func() {
+							if done.Load().(bool) {
+								return
+							}
+							transitionCh <- struct{}{}
+						},
+					},
+				},
+			}
+			s, sqlDB, kvDB := serverutils.StartServer(t, args)
+			defer s.Stopper().Stop(ctx)
+			tdb := sqlutils.MakeSQLRunner(sqlDB)
+			r := s.JobRegistry().(*Registry)
+
+			RegisterConstructor(jobspb.TypeImport, func(job *Job, cs *cluster.Settings) Resumer {
+				return FakeResumer{
+					OnResume: func(ctx context.Context) error {
+						if done.Load().(bool) {
+							return nil
+						}
+						// The code path that we are testing.
+						switch testState {
+						case running:
+							// Do not let the job succeed so that the job can be retried using
+							// the exponential-backoff schedule.
+							return NewRetryJobError("injecting error to retry running")
+						case revertingOnFailed, pauseReverting:
+							// Fail the job to cause it to revert.
+							return errors.Errorf("injecting error to revert")
+						case revertingOnCanceled:
+							// We have to cancel the job to test reverting due to job cancelation.
+							pauseOrCancelJob(t, ctx, kvDB, r, job.ID(), cancel)
+							return nil
+						case pauseRunning:
+							//pauseOrCancelJob(t, ctx, kvDB, r, job.ID(), true)
+							// We can return nil from here because a job is not marked as
+							// succeeded if it's status is not running. After pausing, the
+							// job's status is "pause-requested" in the jobs table.
+							pauseOrCancelJob(t, ctx, kvDB, r, job.ID(), pause)
+							return nil
+						}
+						assert.FailNow(t, "unknown status to test: %s", testState)
+						return nil
+					},
+					FailOrCancel: func(ctx context.Context) error {
+						if done.Load().(bool) {
+							return nil
+						}
+						if testState == pauseReverting {
+							pauseOrCancelJob(t, ctx, kvDB, r, job.ID(), pause)
+							// If we return nil here, the job will be marked as failed regardless of
+							// the fact that it is currently pause-requested in the jobs table. This
+							// is because we currently do not check the current status of a job before
+							// marking it as failed.
+						}
+						return NewRetryJobError("injecting error in reverting state")
+					},
+				}
+			})
+
+			// This test works as follows:
+			// We retry for a fixed number. For each retry:
+			// - We first advance the clock such that it is a little behind the
+			//   next retry time.
+			// - We then wait until a few adopt-loops complete to ensure that
+			//   the registry gets a chance to pick up a job if it can.
+			// - We validate that the number of resumed jobs has not increased to
+			//   ensure that a job is not started/resumed/reverted before its next
+			//   retry time.
+			// - We then advance the clock to the exact next retry time. Now the job
+			//   can be retried in the next adopt-loop.
+			// - We wait until the resumer completes one execution and the job needs
+			//   to be picked up again in the next adopt-loop.
+			// - Now we validate that resumedJobs counter has increment, which ensures
+			//   that the job has completed only one cycle in this time.
+			//
+			// If retries do not happen based on exponential-backoff times, our counters
+			// will not match, causing the test to fail in validateCount.
+
+			adoptItrs := r.metrics.AdoptIterations
+			// Counting the number of times jobs are resumed.
+			resumed := r.metrics.ResumedJobs
+			// Create a new job, which will not be claimed immediately as our clock's
+			// time has not advanced yet.
+			jobID := createJob(ctx, s, r, kvDB)
+			// Expected number of jobs resumed.
+			expResumed := int64(0)
+			// Number of times the job is retried, expected to follow num_runs in jobs.system.
+			retryCnt := 0
+			// We need to adjust the clock to correctly calculate expected retry time of the job.
+			var lastRun time.Time
+			tdb.QueryRow(t,
+				"SELECT created FROM system.jobs where id = $1", jobID,
+			).Scan(&lastRun)
+			// When testing revert state, we first have to let the job run and fail
+			// once to reach the reverting state.
+			if testState == revertingOnFailed || testState == revertingOnCanceled {
+				// When we test the reverting state, we first need to run the job and
+				// cancel it. So we advance the clock such that the job can be started.
+				clock.AdvanceTo(lastRun)
+				// Wait until the resumer completes one execution in the reverting state.
+				<-transitionCh
+				if testState == revertingOnCanceled {
+					<-transitionCh
+				}
+				expResumed = resumed.Count()
+				retryCnt = 1
+			}
+
+			for i := 0; i < retries; i++ {
+				// Exponential delay in the next retry.
+				delay := nextDelay(retryCnt, initDelay, maxDelay)
+				// The delay must not exceed the max delay setting. It ensures that
+				// we are expecting correct timings from our test code, which in turn
+				// ensures that the jobs are resumed with correct exponential delays.
+				require.GreaterOrEqual(t, maxDelay, delay, "delay exceeds the max")
+				// Advance the clock such that it is before the next expected retry time.
+				clock.AdvanceTo(lastRun.Add(delay - unitTime))
+				// This allows adopt-loops to run for a few times, which ensures that
+				// adopt-loops do not resume jobs without correctly following the job
+				// schedules.
+				waitUntilCount(t, adoptItrs, adoptItrs.Count()+2)
+				// Validate that the job is not resumed yet.
+				validateCounts(t, expResumed, resumed.Count())
+				// Advance the clock by delta from the expected time of next retry.
+				clock.Advance(unitTime)
+				// Wait until the resumer completes its execution.
+				<-transitionCh
+				if testState == pauseRunning || testState == pauseReverting {
+					waitUntilStatus(t, tdb, jobID, StatusPaused)
+					require.NoError(t, r.Unpause(ctx, nil, jobID))
+				}
+				expResumed++
+				retryCnt++
+				// Validate that the job is resumed only once.
+				validateCounts(t, expResumed, resumed.Count())
+				lastRun = clock.Now()
+			}
+			done.Store(true)
+			// Let the job be retried one more time.
+			clock.Advance(nextDelay(retryCnt, initDelay, maxDelay))
+			// Wait until the job completes.
+			testutils.SucceedsSoon(t, func() error {
+				var found Status
+				tdb.QueryRow(t, "SELECT status FROM system.jobs WHERE id = $1", jobID).Scan(&found)
+				if found.Terminal() {
+					return nil
+				}
+				retryCnt++
+				clock.Advance(nextDelay(retryCnt, initDelay, maxDelay))
+				return errors.Errorf("waiting job %d to reach a terminal state, currently %s", jobID, found)
+			})
+		})
+	}
+}
+
+// TestExponentialBackoffSettings tests the cluster settings of exponential backoff delays.
+func TestExponentialBackoffSettings(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	for _, test := range [...]struct {
+		name string // Test case ID.
+		// The setting to test.
+		settingKey string
+		// The value of the setting to set.
+		value time.Duration
+	}{
+		{
+			name:       "backoff initial delay setting",
+			settingKey: retryInitialDelaySettingKey,
+			value:      2 * time.Millisecond,
+		},
+		{
+			name:       "backoff max delay setting",
+			settingKey: retryMaxDelaySettingKey,
+			value:      2 * time.Millisecond,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			var tdb *sqlutils.SQLRunner
+			var finished atomic.Value
+			finished.Store(false)
+			var intercepted atomic.Value
+			intercepted.Store(false)
+			intercept := func(orig, updated JobMetadata) error {
+				// If this updated is not to mark as succeeded or the test has already failed.
+				if updated.Status != StatusSucceeded {
+					return nil
+				}
+
+				// If marking the first time, prevent the marking and update the cluster
+				// setting based on test params. The setting value should be reduced
+				// from a large value to a small value.
+				if !intercepted.Load().(bool) {
+					tdb.Exec(t, fmt.Sprintf("SET CLUSTER SETTING %s = '%v'", test.settingKey, test.value))
+					intercepted.Store(true)
+					return errors.Errorf("preventing the job from succeeding")
+				}
+				// Let the job to succeed. As we began with a long interval and prevented
+				// the job than succeeding in the first attempt, its re-execution
+				// indicates that the setting is updated successfully and is in effect.
+				finished.Store(true)
+				return nil
+			}
+
+			// Setup the test cluster.
+			cs := cluster.MakeTestingClusterSettings()
+			// Set a small adopt interval to reduce test time.
+			adoptIntervalSetting.Override(ctx, &cs.SV, 2*time.Millisecond)
+			// Begin with a long delay.
+			retryInitialDelaySetting.Override(ctx, &cs.SV, time.Hour)
+			retryMaxDelaySetting.Override(ctx, &cs.SV, time.Hour)
+			args := base.TestServerArgs{
+				Settings: cs,
+				Knobs:    base.TestingKnobs{JobsTestingKnobs: &TestingKnobs{BeforeUpdate: intercept}},
+			}
+			s, sdb, kvDB := serverutils.StartServer(t, args)
+			defer s.Stopper().Stop(ctx)
+			tdb = sqlutils.MakeSQLRunner(sdb)
+			// Create and run a dummy job.
+			RegisterConstructor(jobspb.TypeImport, func(_ *Job, cs *cluster.Settings) Resumer {
+				return FakeResumer{}
+			})
+			registry := s.JobRegistry().(*Registry)
+			id := registry.MakeJobID()
+			require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				_, err := registry.CreateJobWithTxn(ctx, Record{
+					// Job does not accept an empty Details field, so arbitrarily provide
+					// ImportDetails.
+					Details:  jobspb.ImportDetails{},
+					Progress: jobspb.ImportProgress{},
+				}, id, txn)
+				return err
+			}))
+
+			// Wait for the job to be succeed.
+			testutils.SucceedsSoon(t, func() error {
+				if finished.Load().(bool) {
+					return nil
+				}
+				return errors.Errorf("waiting for the job to complete")
+			})
 		})
 	}
 }
