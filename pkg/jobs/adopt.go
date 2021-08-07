@@ -372,11 +372,11 @@ func (r *Registry) servePauseAndCancelRequests(ctx context.Context, s sqllivenes
 			statusString := *row[1].(*tree.DString)
 			switch Status(statusString) {
 			case StatusPaused:
-				r.unregister(id)
+				r.cancelResumer(id)
 				log.Infof(ctx, "job %d, session %s: paused", id, s.ID())
 			case StatusReverting:
 				if err := job.Update(ctx, txn, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
-					r.unregister(id)
+					r.cancelResumer(id)
 					md.Payload.Error = errJobCanceled.Error()
 					encodedErr := errors.EncodeError(ctx, errJobCanceled)
 					md.Payload.FinalResumeError = &encodedErr

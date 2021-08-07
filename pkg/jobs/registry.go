@@ -1338,3 +1338,12 @@ func (r *Registry) unregister(jobID jobspb.JobID) {
 		delete(r.mu.adoptedJobs, jobID)
 	}
 }
+
+func (r *Registry) cancelResumer(jobID jobspb.JobID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	aj, ok := r.mu.adoptedJobs[jobID]
+	if ok {
+		aj.cancel()
+	}
+}

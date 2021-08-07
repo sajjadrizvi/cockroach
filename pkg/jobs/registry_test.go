@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -35,6 +37,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -346,4 +350,95 @@ func TestBatchJobsCreation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPreventConcurrentResumers(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	createJob := func(
+		ctx context.Context, s serverutils.TestServerInterface, r *Registry, kvDB *kv.DB,
+	) jobspb.JobID {
+		id := r.MakeJobID()
+		require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			_, err := r.CreateJobWithTxn(ctx, Record{
+				Details:  jobspb.ImportDetails{},
+				Progress: jobspb.ImportProgress{},
+			}, id, txn)
+			return err
+		}))
+		return id
+	}
+
+	waitUntilStatus := func(t *testing.T, tdb *sqlutils.SQLRunner, jobID jobspb.JobID, status Status) {
+		tdb.CheckQueryResultsRetry(t,
+			fmt.Sprintf("SELECT status FROM [SHOW JOBS] WHERE job_id = %d", jobID),
+			[][]string{{string(status)}})
+	}
+
+	// pauseOrCancelJob pauses or cancels a job. If pauseJob is true, the job is paused,
+	// otherwise the job is canceled.
+	pauseOrCancelJob := func(
+		t *testing.T, ctx context.Context, db *kv.DB, registry *Registry, jobID jobspb.JobID, pauseJob bool,
+	) {
+		assert.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			if pauseJob {
+				return registry.PauseRequested(ctx, txn, jobID)
+			}
+			return registry.CancelRequested(ctx, txn, jobID)
+		}))
+	}
+
+	var done atomic.Value
+	done.Store(false)
+
+	// Set up the test cluster.
+	args := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: NewTestingKnobsWithShortIntervals(),
+		},
+	}
+	s, sqlDB, kvDB := serverutils.StartServer(t, args)
+	defer s.Stopper().Stop(ctx)
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	r := s.JobRegistry().(*Registry)
+
+	running := int32(0)
+	waitCh := make(chan struct{})
+	RegisterConstructor(jobspb.TypeImport, func(job *Job, cs *cluster.Settings) Resumer {
+		return FakeResumer{
+			OnResume: func(ctx context.Context) error {
+				if done.Load().(bool) {
+					return nil
+				}
+				found := atomic.AddInt32(&running, 1)
+				assert.Equalf(t, 1, found, "expected one running, found %d", found)
+				waitCh <- struct{}{}
+				waitCh <- struct{}{}
+				return nil
+			},
+		}
+	})
+
+	jobID := createJob(ctx, s, r, kvDB)
+	// Wait until the job is resumed.
+	<-waitCh
+	pauseOrCancelJob(t, ctx, kvDB, r, jobID, true)
+	waitUntilStatus(t, tdb, jobID, StatusPaused)
+	require.NoError(t, r.Unpause(ctx, nil, jobID))
+	waitUntilStatus(t, tdb, jobID, StatusRunning)
+	<-waitCh
+	done.Store(true)
+	// Let the job be retried one more time.
+	testutils.SucceedsSoon(t, func() error {
+		var found Status
+		tdb.QueryRow(t, "SELECT status FROM system.jobs WHERE id = $1", jobID).Scan(&found)
+		if found.Terminal() {
+			return nil
+		}
+		return errors.Errorf("waiting job %d to reach a terminal state, currently %s", jobID, found)
+	})
+
+	require.Fail(t, "this test is expected to fail")
 }

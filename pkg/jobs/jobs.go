@@ -928,7 +928,11 @@ func (sj *StartableJob) CleanupOnRollback(ctx context.Context) error {
 	// networking problems leading the transaction in an undefined state.
 	// Given that, proceed to clean up regardless.
 
-	sj.registry.unregister(sj.ID())
+	// Only cancel the resumer and do not unregister. This is because unregister
+	// deletes the job ID from adoptedJobs, which can cause multiple resumers to
+	// execute if the job is paused and unpaused multiple times while reverting.
+
+	sj.registry.cancelResumer(sj.ID())
 	if sj.cancel != nil {
 		sj.cancel()
 	}
@@ -945,6 +949,9 @@ func (sj *StartableJob) CleanupOnRollback(ctx context.Context) error {
 // Cancel will mark the job as canceled and release its resources in the
 // Registry.
 func (sj *StartableJob) Cancel(ctx context.Context) error {
-	defer sj.registry.unregister(sj.ID())
+	// Only cancel the resumer and do not unregister. This is because unregister
+	// deletes the job ID from adoptedJobs, which can cause multiple resumers to
+	// execute if the job is paused and unpaused multiple times while reverting.
+	defer sj.registry.cancelResumer(sj.ID())
 	return sj.registry.CancelRequested(ctx, nil, sj.ID())
 }
